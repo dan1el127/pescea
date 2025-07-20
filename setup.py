@@ -8,7 +8,7 @@ with open("README.md", "r") as fh:
 setup(
     name="pescea",
     packages=find_packages(exclude=["tests", "tests.*"]),
-    version="1.0.12",
+    version="1.1.0",
     license="gpl-3.0",
     description="A python interface to the Escea fireplace controllers",
     long_description=LONG_DESCRIPTION,
