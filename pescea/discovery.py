@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import socket
 
 from abc import abstractmethod, ABC
 from asyncio import (
@@ -14,6 +15,7 @@ from asyncio import (
 from async_timeout import timeout
 from logging import Logger
 from typing import Dict, List, Set, Optional
+import psutil
 
 # Pescea imports:
 from .controller import Controller
@@ -25,8 +27,6 @@ DISCOVERY_SLEEP = 5 * 60.0
 
 # Shorter interval (if we've lost comms to a controller)
 DISCOVERY_RESCAN = 5.0
-
-BROADCAST_IP_ADDR = "255.255.255.255"
 
 _LOG = logging.getLogger(__name__)  # type: Logger
 
@@ -127,13 +127,11 @@ class AbstractDiscoveryService(ABC):
 class DiscoveryService(AbstractDiscoveryService, Listener):
     """Discovery protocol class. Not for external use."""
 
-    def __init__(
-        self, ip_addr: str = BROADCAST_IP_ADDR
-    ) -> None:
-        """Start the discovery protocol 
+    def __init__(self, ip_addr: str | None = None) -> None:
+        """Start the discovery protocol
 
         Args:
-            - ip_addr: Address of controller (otherwise will broadcast)
+            ip_addr (str | None): Address of controller. Defaults to None which will broadcast to all interfaces
         raises:
             RuntimeError: If attempted to start the protocol when it is
                           already running.
@@ -147,7 +145,7 @@ class DiscoveryService(AbstractDiscoveryService, Listener):
         self.loop = asyncio.get_running_loop()
         self.sending_lock = Lock()
 
-        self._broadcast_ip = ip_addr
+        self._ip_addr = ip_addr
         self._datagram = Datagram(self.loop, ip_addr, self.sending_lock)
 
         self._discovery_started = False
@@ -231,6 +229,25 @@ class DiscoveryService(AbstractDiscoveryService, Listener):
         """Dictionary of all the currently discovered controllers"""
         return self._controllers
 
+    @staticmethod
+    def get_broadcast_addresses() -> list[str]:
+        """Get a list of broadcast addresses by iterating over interfaces"""
+        broadcast_addrs = set()
+
+        for interface_name, interface_addrs in psutil.net_if_addrs().items():
+            for addr in interface_addrs:
+                if addr.family == socket.AF_INET and addr.broadcast:
+                    _LOG.debug(
+                        "Found broadcast address: %s for %s",
+                        addr.broadcast,
+                        interface_name,
+                    )
+                    broadcast_addrs.add(addr.broadcast)
+
+        _LOG.debug("Found broadcast addresses: %s", broadcast_addrs)
+
+        return list(broadcast_addrs)
+
     async def start_discovery(self) -> None:
         """Non-context manager version for starting discovery"""
         if not self._discovery_started:
@@ -255,14 +272,41 @@ class DiscoveryService(AbstractDiscoveryService, Listener):
                 pass
 
     async def _send_broadcast(self):
-        """Send UDP commands to broadcast address to search for fires"""
-        _LOG.debug("Sending discovery message to addr %s", self._broadcast_ip)
-        try:
-            responses = await self._datagram.send_command(CommandID.SEARCH_FOR_FIRES)
-            for addr in responses:
-                self._discovery_received(responses[addr], addr)
-        except ConnectionError:
-            _LOG.warning("No controllers responded to broadcast")
+        """Send UDP commands to IPs to search for fires"""
+        # If self._ip_addr is not None, we are not targeting a specific IP, so get list of broadcast IPs
+        ip_addresses = (
+            self.get_broadcast_addresses() if not self._ip_addr else [self._ip_addr]
+        )
+        all_responses = {}
+
+        # Loop over each IP address and send a broadcast listening for reply from a Fire
+        for ip_addr in ip_addresses:
+            _LOG.debug(
+                "Sending discovery message to addr %s",
+                ip_addr,
+            )
+            # Temporarily set the datagram IP to the IP address we want to broadcast
+            original_ip = self._datagram.ip
+            self._datagram.set_ip(ip_addr)
+            try:
+                responses = await self._datagram.send_command(
+                    CommandID.SEARCH_FOR_FIRES
+                )
+                all_responses.update(responses)
+            except ConnectionError:
+                _LOG.debug(
+                    "No controllers responded at %s",
+                    ip_addr,
+                )
+            finally:
+                # Restore original IP, even if an exception occurred
+                self._datagram.set_ip(original_ip)
+
+        if all_responses:
+            for ip_addr, resp in all_responses.items():
+                self._discovery_received(resp, ip_addr)
+        else:
+            _LOG.warning("No controllers responded.")
 
     async def rescan(self) -> None:
         """Request a rescan of fireplaces (eg after losing comms)"""
@@ -327,8 +371,7 @@ class DiscoveryService(AbstractDiscoveryService, Listener):
 
 
 def discovery_service(
-    *listeners: Listener,
-    ip_addr: str = BROADCAST_IP_ADDR
+    *listeners: Listener, ip_addr: str | None = None
 ) -> AbstractDiscoveryService:
     """Create discovery service. Returned object is an asynchronous
     context manager so can be used with 'async with' statement.
