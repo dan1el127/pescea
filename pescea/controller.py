@@ -635,8 +635,19 @@ class Controller:
         # save the new value internally
         self._system_settings[state] = value
 
-        # send it to the fireplace if asked to sync, or fireplace is not busy
-        if sync or self._state == Controller.State.READY:
+        # send it to the fireplace if asked to sync, or the controller is not
+        # mid-transition / offline.
+        # FIX (responsiveness): also transmit while NON_RESPONSIVE. That state
+        # only means we missed some UDP polls; the unit is very likely still
+        # reachable, so a command pressed during a blip should go out NOW rather
+        # than be silently buffered and only reconciled ~66s later at BUSY expiry
+        # (which read as "I pressed off and nothing happened"). For a power toggle
+        # a failed send still falls through to BUSY below, so the buffered intent
+        # stays protected and the sync branch re-sends if this attempt missed.
+        if sync or self._state in (
+            Controller.State.READY,
+            Controller.State.NON_RESPONSIVE,
+        ):
 
             command = None
 
@@ -697,7 +708,16 @@ class Controller:
                 )
                 if valid_response:
                     self._last_response = time()
+                elif state == Controller.Settings.FIRE_IS_ON:
+                    # Power toggle: even if this send missed, fall through to the
+                    # BUSY entry below so the buffered power state is protected and
+                    # the sync branch re-sends at BUSY expiry (never orphaned).
+                    _trace(
+                        "_set_system_state: power send missed, "
+                        "falling through to BUSY (buffer protected)"
+                    )
                 else:
+                    # temp/fan: a failed send aborts (nothing to protect via BUSY)
                     return
 
             if state == Controller.Settings.FAN_MODE:
