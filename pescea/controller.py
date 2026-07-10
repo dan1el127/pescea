@@ -22,21 +22,8 @@ from .datagram import Datagram
 
 _LOG = logging.getLogger(__name__)
 
-
-# ===========================================================================
-# TEMPORARY live-test tracing — REMOVE before release.
-# WARNING level so lines show in the standard HA log with no extra logger
-# config. Fixed prefix so the operator can `grep ESCEA-TRACE` the HA log.
-# ===========================================================================
-def _trace(msg, *args):
-    _LOG.warning("[ESCEA-TRACE] " + msg, *args)
-
-
 # Seconds between (internal) updates under normal conditions
-# TEMPORARY: dropped from 30.0 to 4.0 for live-testing so the operator gets
-# fine-grained samples of fire_is_on through the post-off cool-down window.
-# REVERT to 30.0 before release.
-REFRESH_INTERVAL = 4.0
+REFRESH_INTERVAL = 30.0
 
 # Seconds between publishing changes to listeners
 # - Updates due to changes happen immediately
@@ -195,15 +182,6 @@ class Controller:
             elif self._state == Controller.State.BUSY:
                 sleep_time = max(self._busy_end_time - time(), 0.0)
 
-            _trace(
-                "_poll_loop: state=%s sleep=%.1fs busy_remaining=%.1fs",
-                self._state,
-                sleep_time,
-                (self._busy_end_time - time())
-                if self._state == Controller.State.BUSY
-                else -1.0,
-            )
-
             try:
                 # Sleep for poll time, allow early wakeup
                 async with timeout(sleep_time):
@@ -311,9 +289,9 @@ class Controller:
             request status
 
             New status received:
-                if prior state READY
+                if prior state READY / NON_RESPONSIVE
                     update local system settings from received message
-                else (prior state DISCONNECTED / NON_RESPONSIVE / BUSY (timeout))
+                else (prior state DISCONNECTED / BUSY (timeout))
                     sync buffered commands to fireplace
                     new state READY
                     if prior state DISCONNECTED:
@@ -330,23 +308,10 @@ class Controller:
         if self._state != Controller.State.BUSY or time() >= self._busy_end_time:
             # Ok to fetch new status
 
-            _trace(
-                "_refresh_system: PROCEEDING with status read (prior_state=%s)",
-                self._state,
-            )
             prior_state = self._state
             response = await self._request_status()
             if (response is not None) and (response.response_id == ResponseID.STATUS):
                 # We have a valid response - the controller is communicating
-
-                _trace(
-                    "_refresh_system: valid STATUS  prior_state=%s  "
-                    "response.fire_is_on=%s  buffered FIRE_IS_ON=%s  buffered FAN_MODE=%s",
-                    prior_state,
-                    response.fire_is_on,
-                    self._system_settings.get(Controller.Settings.FIRE_IS_ON),
-                    self._system_settings.get(Controller.Settings.FAN_MODE),
-                )
 
                 self._state = Controller.State.READY
 
@@ -358,22 +323,15 @@ class Controller:
                     Controller.Settings.CURRENT_TEMP
                 ] = response.current_temp
 
-                # FIX (RCA update): NON_RESPONSIVE just means we missed some UDP
-                # replies - nothing was buffered as a user command, so on recovery
-                # we must TRUST the fresh status, not re-sync a stale buffer. Only
-                # BUSY (a real buffered power toggle) and DISCONNECTED take the sync
-                # path. This is what stops the remote-off relight: after a remote
-                # off the unit goes NON_RESPONSIVE then reports fire_on=False, and
-                # we now accept that instead of re-sending POWER_ON.
+                # NON_RESPONSIVE only means we missed some UDP polls (no buffered
+                # user command), so trust the fresh status like READY. Only BUSY
+                # and DISCONNECTED sync buffered commands. Trusting status here is
+                # what stops the relight after an out-of-band (remote) off.
                 if prior_state in (
                     Controller.State.READY,
                     Controller.State.NON_RESPONSIVE,
                 ):
 
-                    _trace(
-                        "_refresh_system: BRANCH = NORMAL-UPDATE (prior=%s)",
-                        prior_state,
-                    )
                     # Normal operation, update our internal values
                     self._system_settings[
                         Controller.Settings.DESIRED_TEMP
@@ -390,22 +348,12 @@ class Controller:
                         self._system_settings[
                             Controller.Settings.FAN_MODE
                         ] = Controller.Fan.AUTO
-                    _trace(
-                        "_refresh_system: NORMAL-UPDATE CLOBBER "
-                        "local FIRE_IS_ON %s <- status %s",
-                        self._system_settings.get(Controller.Settings.FIRE_IS_ON),
-                        response.fire_is_on,
-                    )
                     self._system_settings[
                         Controller.Settings.FIRE_IS_ON
                     ] = response.fire_is_on
 
                 else:
 
-                    _trace(
-                        "_refresh_system: BRANCH = SYNC-BUFFERED (prior=%s)",
-                        prior_state,
-                    )
                     # We have come back to READY state.
                     # We need to try to sync buffered settings to fireplace
 
@@ -443,59 +391,33 @@ class Controller:
                                 sync=True,
                             )
 
-                    # Do power last, as then we go to BUSY state
-                    buffered_on = self._system_settings[
-                        Controller.Settings.FIRE_IS_ON
-                    ]
+                    # Do power last, as then we go to BUSY state.
+                    # Fail-safe: only ever re-send POWER_OFF here (safe direction);
+                    # never auto-relight a gas fire from a possibly-stale buffer.
+                    # If the buffer says ON but the unit reports OFF, accept OFF.
+                    buffered_on = self._system_settings[Controller.Settings.FIRE_IS_ON]
                     if response.fire_is_on != buffered_on:
                         if not buffered_on:
-                            # Buffer says OFF, unit reports ON -> re-send POWER_OFF.
-                            # This direction is safe (never lights a gas fire).
-                            _trace(
-                                "_refresh_system: SYNC-BUFFERED power mismatch "
-                                "buffered=False response=True -> RE-SEND POWER_OFF",
-                            )
                             await self._set_system_state(
                                 Controller.Settings.FIRE_IS_ON,
                                 False,
                                 sync=True,
                             )
                         else:
-                            # Buffer says ON, unit reports OFF. FAIL-SAFE: never
-                            # auto-relight a gas fire from a possibly-stale buffer.
-                            # Accept the unit's OFF state instead of POWER_ON.
-                            _trace(
-                                "_refresh_system: FAIL-SAFE suppressing POWER_ON "
-                                "re-send (buffered=True response=False); accepting "
-                                "unit OFF",
-                            )
                             self._system_settings[
                                 Controller.Settings.FIRE_IS_ON
                             ] = response.fire_is_on
-                    else:
-                        _trace(
-                            "_refresh_system: SYNC-BUFFERED power OK "
-                            "(buffered=%s == response=%s, no re-send)",
-                            buffered_on,
-                            response.fire_is_on,
-                        )
 
                     if prior_state == Controller.State.DISCONNECTED:
                         self._discovery.controller_reconnected(self)
 
             else:
-                # No / invalid response, need to check if we need to change state
-                #
-                # FIX (availability): don't count the BUSY window against the
-                # disconnect timer. While BUSY (66s) we intentionally skip polls,
-                # so _last_response is frozen. Since ON_OFF_BUSY_WAIT_TIME (66s) >
-                # RETRY_TIMEOUT (60s), the FIRST missed poll right after a toggle
-                # would otherwise always be >RETRY_TIMEOUT old and jump straight to
-                # DISCONNECTED (5-min backoff + entity goes unavailable), skipping
-                # NON_RESPONSIVE entirely. The unit commonly goes briefly silent
-                # after ignition, so this hit on nearly every HA on/off. Measuring
-                # from max(_last_response, _busy_end_time) means a miss just after
-                # BUSY is treated as NON_RESPONSIVE (10s retry) and recovers fast.
+                # No / invalid response, need to check if we need to change state.
+                # Measure downtime from max(_last_response, _busy_end_time): the
+                # BUSY window (66s) skips polls and freezes _last_response, and
+                # since it exceeds RETRY_TIMEOUT (60s) the first post-toggle miss
+                # would otherwise jump straight to DISCONNECTED. This keeps it
+                # NON_RESPONSIVE (fast retry) instead of going unavailable.
                 last_ok = max(self._last_response, self._busy_end_time)
                 if time() - last_ok < RETRY_TIMEOUT:
                     self._state = Controller.State.NON_RESPONSIVE
@@ -503,18 +425,6 @@ class Controller:
                     self._state = Controller.State.DISCONNECTED
                     if prior_state != Controller.State.DISCONNECTED:
                         self._discovery.controller_disconnected(self, TimeoutError)
-                _trace(
-                    "_refresh_system: BRANCH = NO/INVALID RESPONSE -> %s "
-                    "(since last_ok=%.1fs)",
-                    self._state,
-                    time() - last_ok,
-                )
-
-        else:
-            _trace(
-                "_refresh_system: SKIPPING status read (BUSY, %.1fs left)",
-                self._busy_end_time - time(),
-            )
 
         if notify and self._state != Controller.State.DISCONNECTED:
             # send an update to discovery if there have been any changes
@@ -527,20 +437,12 @@ class Controller:
                     changes_found = True
                     break
             if changes_found or (time() - self._last_update > NOTIFY_REFRESH_INTERVAL):
-                _trace(
-                    "_refresh_system: NOTIFY controller_update (changes_found=%s) "
-                    "FIRE_IS_ON=%s FAN_MODE=%s",
-                    changes_found,
-                    self._system_settings.get(Controller.Settings.FIRE_IS_ON),
-                    self._system_settings.get(Controller.Settings.FAN_MODE),
-                )
                 self._last_update = time()
                 self._prior_settings = deepcopy(self._system_settings)
                 self._discovery.controller_update(self)
 
     async def _request_status(self) -> Message:
         """Send command to fireplace requesting current status"""
-        _trace("_request_status: sent STATUS_PLEASE to %s", str(self.device_uid))
         try:
             responses = await self._datagram.send_command(CommandID.STATUS_PLEASE)
             if len(responses) > 0:
@@ -553,18 +455,7 @@ class Controller:
                         str(self.device_uid),
                     )
                     self._last_response = time()
-                    reply = responses[this_response]
-                    _trace(
-                        "_request_status: STATUS reply  fire_is_on=%s "
-                        "fan_boost_is_on=%s flame_effect=%s desired_temp=%s "
-                        "current_temp=%s",
-                        reply.fire_is_on,
-                        reply.fan_boost_is_on,
-                        reply.flame_effect,
-                        reply.desired_temp,
-                        reply.current_temp,
-                    )
-                    return reply
+                    return responses[this_response]
         except ConnectionError:
             pass
         # If we get here... did not receive a response or not valid
@@ -572,11 +463,6 @@ class Controller:
             self._state = Controller.State.NON_RESPONSIVE
         _LOG.debug(
             "_request_status - send_command(failed): %s (now: %s)",
-            str(self.device_uid),
-            self._state,
-        )
-        _trace(
-            "_request_status: NO/INVALID reply from %s (state now %s)",
             str(self.device_uid),
             self._state,
         )
@@ -607,20 +493,8 @@ class Controller:
             sync: state/value have been buffered -> send to fireplace
         """
 
-        _trace(
-            "_set_system_state: ENTER state=%s from=%s to=%s sync=%s (ctrl_state=%s)",
-            state,
-            self._system_settings.get(state),
-            value,
-            sync,
-            self._state,
-        )
-
         # nothing to do if not synching our state, and already have right state
         if (not sync) and (self._system_settings[state] == value):
-            _trace(
-                "_set_system_state: EARLY-RETURN (already %s, not syncing)", value
-            )
             return
 
         _LOG.debug(
@@ -635,15 +509,10 @@ class Controller:
         # save the new value internally
         self._system_settings[state] = value
 
-        # send it to the fireplace if asked to sync, or the controller is not
-        # mid-transition / offline.
-        # FIX (responsiveness): also transmit while NON_RESPONSIVE. That state
-        # only means we missed some UDP polls; the unit is very likely still
-        # reachable, so a command pressed during a blip should go out NOW rather
-        # than be silently buffered and only reconciled ~66s later at BUSY expiry
-        # (which read as "I pressed off and nothing happened"). For a power toggle
-        # a failed send still falls through to BUSY below, so the buffered intent
-        # stays protected and the sync branch re-sends if this attempt missed.
+        # Send now if synching, or the controller is READY / NON_RESPONSIVE.
+        # NON_RESPONSIVE is a transient missed-poll state (unit likely still
+        # reachable), so send rather than silently defer to BUSY expiry. A failed
+        # power send still falls through to BUSY below so the intent is protected.
         if sync or self._state in (
             Controller.State.READY,
             Controller.State.NON_RESPONSIVE,
@@ -684,7 +553,6 @@ class Controller:
                 raise (AttributeError, "Unexpected state: {0}".format(state))
 
             if command is not None:
-                _trace("_set_system_state: sending command %s", command)
                 valid_response = False
                 try:
                     responses = await self._datagram.send_command(command, value)
@@ -701,21 +569,12 @@ class Controller:
 
                 except ConnectionError:
                     pass
-                _trace(
-                    "_set_system_state: command %s ack_valid=%s",
-                    command,
-                    valid_response,
-                )
                 if valid_response:
                     self._last_response = time()
                 elif state == Controller.Settings.FIRE_IS_ON:
-                    # Power toggle: even if this send missed, fall through to the
-                    # BUSY entry below so the buffered power state is protected and
-                    # the sync branch re-sends at BUSY expiry (never orphaned).
-                    _trace(
-                        "_set_system_state: power send missed, "
-                        "falling through to BUSY (buffer protected)"
-                    )
+                    # Power toggle: fall through to BUSY so the buffered state is
+                    # protected and re-sent at BUSY expiry (never orphaned).
+                    pass
                 else:
                     # temp/fan: a failed send aborts (nothing to protect via BUSY)
                     return
@@ -759,26 +618,14 @@ class Controller:
                 else:
                     return
 
-        # FIX (RCA §4): for a power toggle, enter BUSY *before* the immediate
-        # refresh. The unit keeps reporting fire_is_on=True during its post-off
-        # cool-down, so an immediate status read here would clobber the just-
-        # buffered power state (and bounce the HA entity back to "on"). Setting
-        # BUSY first makes _refresh_system() skip the status read (BUSY guard).
+        # For a power toggle enter BUSY *before* the immediate refresh, so the
+        # read is skipped (BUSY guard) instead of clobbering the just-buffered
+        # power state with the unit's stale post-toggle cool-down status.
         if state == Controller.Settings.FIRE_IS_ON:
-            _trace(
-                "_set_system_state: entering BUSY for %.0fs BEFORE refresh "
-                "(buffered FIRE_IS_ON=%s)",
-                ON_OFF_BUSY_WAIT_TIME,
-                self._system_settings.get(Controller.Settings.FIRE_IS_ON),
-            )
             self._state = Controller.State.BUSY
             self._busy_end_time = time() + ON_OFF_BUSY_WAIT_TIME
 
         # Need to refresh immediately after setting
         # (unless synching, in which case the poll loop will update)
         if not sync:
-            _trace(
-                "_set_system_state: POST-COMMAND immediate refresh (ctrl_state=%s)",
-                self._state,
-            )
             await self._refresh_system()

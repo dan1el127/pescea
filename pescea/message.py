@@ -268,19 +268,6 @@ class Message:
                 incoming[MSG_OFFSET_DATA_START + DATA_OFFSET_CURRENT_TEMP]
             )
 
-            # TEMPORARY live-test tracing — REMOVE before release.
-            _LOG.warning(
-                "[ESCEA-TRACE] STATUS raw=%s  fire_on=%s boost=%s effect=%s "
-                "desired=%s current=%s new_timers=%s",
-                incoming.hex(),
-                self._fire_on,
-                self._fan_boost_on,
-                self._effect_on,
-                self._desired_temp,
-                self._current_temp,
-                self._has_new_timers,
-            )
-
         elif (self._id) == ResponseID.I_AM_A_FIRE:
             if incoming[MSG_OFFSET_DATA_LENGTH] != 6:
                 # Just log this... there is an error on the fireplace side here
