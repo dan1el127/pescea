@@ -485,15 +485,29 @@ class Controller:
 
             else:
                 # No / invalid response, need to check if we need to change state
-                if time() - self._last_response < RETRY_TIMEOUT:
+                #
+                # FIX (availability): don't count the BUSY window against the
+                # disconnect timer. While BUSY (66s) we intentionally skip polls,
+                # so _last_response is frozen. Since ON_OFF_BUSY_WAIT_TIME (66s) >
+                # RETRY_TIMEOUT (60s), the FIRST missed poll right after a toggle
+                # would otherwise always be >RETRY_TIMEOUT old and jump straight to
+                # DISCONNECTED (5-min backoff + entity goes unavailable), skipping
+                # NON_RESPONSIVE entirely. The unit commonly goes briefly silent
+                # after ignition, so this hit on nearly every HA on/off. Measuring
+                # from max(_last_response, _busy_end_time) means a miss just after
+                # BUSY is treated as NON_RESPONSIVE (10s retry) and recovers fast.
+                last_ok = max(self._last_response, self._busy_end_time)
+                if time() - last_ok < RETRY_TIMEOUT:
                     self._state = Controller.State.NON_RESPONSIVE
                 else:
                     self._state = Controller.State.DISCONNECTED
                     if prior_state != Controller.State.DISCONNECTED:
                         self._discovery.controller_disconnected(self, TimeoutError)
                 _trace(
-                    "_refresh_system: BRANCH = NO/INVALID RESPONSE -> %s",
+                    "_refresh_system: BRANCH = NO/INVALID RESPONSE -> %s "
+                    "(since last_ok=%.1fs)",
                     self._state,
+                    time() - last_ok,
                 )
 
         else:
