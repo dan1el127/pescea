@@ -22,8 +22,21 @@ from .datagram import Datagram
 
 _LOG = logging.getLogger(__name__)
 
+
+# ===========================================================================
+# TEMPORARY live-test tracing — REMOVE before release.
+# WARNING level so lines show in the standard HA log with no extra logger
+# config. Fixed prefix so the operator can `grep ESCEA-TRACE` the HA log.
+# ===========================================================================
+def _trace(msg, *args):
+    _LOG.warning("[ESCEA-TRACE] " + msg, *args)
+
+
 # Seconds between (internal) updates under normal conditions
-REFRESH_INTERVAL = 30.0
+# TEMPORARY: dropped from 30.0 to 4.0 for live-testing so the operator gets
+# fine-grained samples of fire_is_on through the post-off cool-down window.
+# REVERT to 30.0 before release.
+REFRESH_INTERVAL = 4.0
 
 # Seconds between publishing changes to listeners
 # - Updates due to changes happen immediately
@@ -182,6 +195,15 @@ class Controller:
             elif self._state == Controller.State.BUSY:
                 sleep_time = max(self._busy_end_time - time(), 0.0)
 
+            _trace(
+                "_poll_loop: state=%s sleep=%.1fs busy_remaining=%.1fs",
+                self._state,
+                sleep_time,
+                (self._busy_end_time - time())
+                if self._state == Controller.State.BUSY
+                else -1.0,
+            )
+
             try:
                 # Sleep for poll time, allow early wakeup
                 async with timeout(sleep_time):
@@ -308,10 +330,23 @@ class Controller:
         if self._state != Controller.State.BUSY or time() >= self._busy_end_time:
             # Ok to fetch new status
 
+            _trace(
+                "_refresh_system: PROCEEDING with status read (prior_state=%s)",
+                self._state,
+            )
             prior_state = self._state
             response = await self._request_status()
             if (response is not None) and (response.response_id == ResponseID.STATUS):
                 # We have a valid response - the controller is communicating
+
+                _trace(
+                    "_refresh_system: valid STATUS  prior_state=%s  "
+                    "response.fire_is_on=%s  buffered FIRE_IS_ON=%s  buffered FAN_MODE=%s",
+                    prior_state,
+                    response.fire_is_on,
+                    self._system_settings.get(Controller.Settings.FIRE_IS_ON),
+                    self._system_settings.get(Controller.Settings.FAN_MODE),
+                )
 
                 self._state = Controller.State.READY
 
@@ -325,6 +360,7 @@ class Controller:
 
                 if prior_state == Controller.State.READY:
 
+                    _trace("_refresh_system: BRANCH = NORMAL-UPDATE (prior READY)")
                     # Normal operation, update our internal values
                     self._system_settings[
                         Controller.Settings.DESIRED_TEMP
@@ -341,12 +377,22 @@ class Controller:
                         self._system_settings[
                             Controller.Settings.FAN_MODE
                         ] = Controller.Fan.AUTO
+                    _trace(
+                        "_refresh_system: NORMAL-UPDATE CLOBBER "
+                        "local FIRE_IS_ON %s <- status %s",
+                        self._system_settings.get(Controller.Settings.FIRE_IS_ON),
+                        response.fire_is_on,
+                    )
                     self._system_settings[
                         Controller.Settings.FIRE_IS_ON
                     ] = response.fire_is_on
 
                 else:
 
+                    _trace(
+                        "_refresh_system: BRANCH = SYNC-BUFFERED (prior=%s)",
+                        prior_state,
+                    )
                     # We have come back to READY state.
                     # We need to try to sync buffered settings to fireplace
 
@@ -389,10 +435,27 @@ class Controller:
                         response.fire_is_on
                         != self._system_settings[Controller.Settings.FIRE_IS_ON]
                     ):
+                        _trace(
+                            "_refresh_system: SYNC-BUFFERED POWER MISMATCH "
+                            "buffered=%s response=%s -> RE-SEND POWER_%s  "
+                            "*** THIS IS THE RELIGHT/RE-COMMAND POINT ***",
+                            self._system_settings[Controller.Settings.FIRE_IS_ON],
+                            response.fire_is_on,
+                            "ON"
+                            if self._system_settings[Controller.Settings.FIRE_IS_ON]
+                            else "OFF",
+                        )
                         await self._set_system_state(
                             Controller.Settings.FIRE_IS_ON,
                             self._system_settings[Controller.Settings.FIRE_IS_ON],
                             sync=True,
+                        )
+                    else:
+                        _trace(
+                            "_refresh_system: SYNC-BUFFERED power OK "
+                            "(buffered=%s == response=%s, no re-send)",
+                            self._system_settings[Controller.Settings.FIRE_IS_ON],
+                            response.fire_is_on,
                         )
 
                     if prior_state == Controller.State.DISCONNECTED:
@@ -406,6 +469,16 @@ class Controller:
                     self._state = Controller.State.DISCONNECTED
                     if prior_state != Controller.State.DISCONNECTED:
                         self._discovery.controller_disconnected(self, TimeoutError)
+                _trace(
+                    "_refresh_system: BRANCH = NO/INVALID RESPONSE -> %s",
+                    self._state,
+                )
+
+        else:
+            _trace(
+                "_refresh_system: SKIPPING status read (BUSY, %.1fs left)",
+                self._busy_end_time - time(),
+            )
 
         if notify and self._state != Controller.State.DISCONNECTED:
             # send an update to discovery if there have been any changes
@@ -418,12 +491,20 @@ class Controller:
                     changes_found = True
                     break
             if changes_found or (time() - self._last_update > NOTIFY_REFRESH_INTERVAL):
+                _trace(
+                    "_refresh_system: NOTIFY controller_update (changes_found=%s) "
+                    "FIRE_IS_ON=%s FAN_MODE=%s",
+                    changes_found,
+                    self._system_settings.get(Controller.Settings.FIRE_IS_ON),
+                    self._system_settings.get(Controller.Settings.FAN_MODE),
+                )
                 self._last_update = time()
                 self._prior_settings = deepcopy(self._system_settings)
                 self._discovery.controller_update(self)
 
     async def _request_status(self) -> Message:
         """Send command to fireplace requesting current status"""
+        _trace("_request_status: sent STATUS_PLEASE to %s", str(self.device_uid))
         try:
             responses = await self._datagram.send_command(CommandID.STATUS_PLEASE)
             if len(responses) > 0:
@@ -436,7 +517,18 @@ class Controller:
                         str(self.device_uid),
                     )
                     self._last_response = time()
-                    return responses[this_response]
+                    reply = responses[this_response]
+                    _trace(
+                        "_request_status: STATUS reply  fire_is_on=%s "
+                        "fan_boost_is_on=%s flame_effect=%s desired_temp=%s "
+                        "current_temp=%s",
+                        reply.fire_is_on,
+                        reply.fan_boost_is_on,
+                        reply.flame_effect,
+                        reply.desired_temp,
+                        reply.current_temp,
+                    )
+                    return reply
         except ConnectionError:
             pass
         # If we get here... did not receive a response or not valid
@@ -444,6 +536,11 @@ class Controller:
             self._state = Controller.State.NON_RESPONSIVE
         _LOG.debug(
             "_request_status - send_command(failed): %s (now: %s)",
+            str(self.device_uid),
+            self._state,
+        )
+        _trace(
+            "_request_status: NO/INVALID reply from %s (state now %s)",
             str(self.device_uid),
             self._state,
         )
@@ -474,8 +571,20 @@ class Controller:
             sync: state/value have been buffered -> send to fireplace
         """
 
+        _trace(
+            "_set_system_state: ENTER state=%s from=%s to=%s sync=%s (ctrl_state=%s)",
+            state,
+            self._system_settings.get(state),
+            value,
+            sync,
+            self._state,
+        )
+
         # nothing to do if not synching our state, and already have right state
         if (not sync) and (self._system_settings[state] == value):
+            _trace(
+                "_set_system_state: EARLY-RETURN (already %s, not syncing)", value
+            )
             return
 
         _LOG.debug(
@@ -528,6 +637,7 @@ class Controller:
                 raise (AttributeError, "Unexpected state: {0}".format(state))
 
             if command is not None:
+                _trace("_set_system_state: sending command %s", command)
                 valid_response = False
                 try:
                     responses = await self._datagram.send_command(command, value)
@@ -544,6 +654,11 @@ class Controller:
 
                 except ConnectionError:
                     pass
+                _trace(
+                    "_set_system_state: command %s ack_valid=%s",
+                    command,
+                    valid_response,
+                )
                 if valid_response:
                     self._last_response = time()
                 else:
@@ -591,9 +706,20 @@ class Controller:
         # Need to refresh immediately after setting
         # (unless synching, in which case the poll loop will update)
         if not sync:
+            _trace(
+                "_set_system_state: POST-COMMAND immediate refresh "
+                "(ctrl_state=%s, still READY -> NORMAL-UPDATE clobber risk)",
+                self._state,
+            )
             await self._refresh_system()
 
         # If get here, and just toggled the fireplace power... need to buffer for a while
         if state == Controller.Settings.FIRE_IS_ON:
+            _trace(
+                "_set_system_state: entering BUSY for %.0fs "
+                "(buffered FIRE_IS_ON=%s)",
+                ON_OFF_BUSY_WAIT_TIME,
+                self._system_settings.get(Controller.Settings.FIRE_IS_ON),
+            )
             self._state = Controller.State.BUSY
             self._busy_end_time = time() + ON_OFF_BUSY_WAIT_TIME
