@@ -358,9 +358,22 @@ class Controller:
                     Controller.Settings.CURRENT_TEMP
                 ] = response.current_temp
 
-                if prior_state == Controller.State.READY:
+                # FIX (RCA update): NON_RESPONSIVE just means we missed some UDP
+                # replies - nothing was buffered as a user command, so on recovery
+                # we must TRUST the fresh status, not re-sync a stale buffer. Only
+                # BUSY (a real buffered power toggle) and DISCONNECTED take the sync
+                # path. This is what stops the remote-off relight: after a remote
+                # off the unit goes NON_RESPONSIVE then reports fire_on=False, and
+                # we now accept that instead of re-sending POWER_ON.
+                if prior_state in (
+                    Controller.State.READY,
+                    Controller.State.NON_RESPONSIVE,
+                ):
 
-                    _trace("_refresh_system: BRANCH = NORMAL-UPDATE (prior READY)")
+                    _trace(
+                        "_refresh_system: BRANCH = NORMAL-UPDATE (prior=%s)",
+                        prior_state,
+                    )
                     # Normal operation, update our internal values
                     self._system_settings[
                         Controller.Settings.DESIRED_TEMP
@@ -431,30 +444,39 @@ class Controller:
                             )
 
                     # Do power last, as then we go to BUSY state
-                    if (
-                        response.fire_is_on
-                        != self._system_settings[Controller.Settings.FIRE_IS_ON]
-                    ):
-                        _trace(
-                            "_refresh_system: SYNC-BUFFERED POWER MISMATCH "
-                            "buffered=%s response=%s -> RE-SEND POWER_%s  "
-                            "*** THIS IS THE RELIGHT/RE-COMMAND POINT ***",
-                            self._system_settings[Controller.Settings.FIRE_IS_ON],
-                            response.fire_is_on,
-                            "ON"
-                            if self._system_settings[Controller.Settings.FIRE_IS_ON]
-                            else "OFF",
-                        )
-                        await self._set_system_state(
-                            Controller.Settings.FIRE_IS_ON,
-                            self._system_settings[Controller.Settings.FIRE_IS_ON],
-                            sync=True,
-                        )
+                    buffered_on = self._system_settings[
+                        Controller.Settings.FIRE_IS_ON
+                    ]
+                    if response.fire_is_on != buffered_on:
+                        if not buffered_on:
+                            # Buffer says OFF, unit reports ON -> re-send POWER_OFF.
+                            # This direction is safe (never lights a gas fire).
+                            _trace(
+                                "_refresh_system: SYNC-BUFFERED power mismatch "
+                                "buffered=False response=True -> RE-SEND POWER_OFF",
+                            )
+                            await self._set_system_state(
+                                Controller.Settings.FIRE_IS_ON,
+                                False,
+                                sync=True,
+                            )
+                        else:
+                            # Buffer says ON, unit reports OFF. FAIL-SAFE: never
+                            # auto-relight a gas fire from a possibly-stale buffer.
+                            # Accept the unit's OFF state instead of POWER_ON.
+                            _trace(
+                                "_refresh_system: FAIL-SAFE suppressing POWER_ON "
+                                "re-send (buffered=True response=False); accepting "
+                                "unit OFF",
+                            )
+                            self._system_settings[
+                                Controller.Settings.FIRE_IS_ON
+                            ] = response.fire_is_on
                     else:
                         _trace(
                             "_refresh_system: SYNC-BUFFERED power OK "
                             "(buffered=%s == response=%s, no re-send)",
-                            self._system_settings[Controller.Settings.FIRE_IS_ON],
+                            buffered_on,
                             response.fire_is_on,
                         )
 
@@ -703,23 +725,26 @@ class Controller:
                 else:
                     return
 
-        # Need to refresh immediately after setting
-        # (unless synching, in which case the poll loop will update)
-        if not sync:
-            _trace(
-                "_set_system_state: POST-COMMAND immediate refresh "
-                "(ctrl_state=%s, still READY -> NORMAL-UPDATE clobber risk)",
-                self._state,
-            )
-            await self._refresh_system()
-
-        # If get here, and just toggled the fireplace power... need to buffer for a while
+        # FIX (RCA §4): for a power toggle, enter BUSY *before* the immediate
+        # refresh. The unit keeps reporting fire_is_on=True during its post-off
+        # cool-down, so an immediate status read here would clobber the just-
+        # buffered power state (and bounce the HA entity back to "on"). Setting
+        # BUSY first makes _refresh_system() skip the status read (BUSY guard).
         if state == Controller.Settings.FIRE_IS_ON:
             _trace(
-                "_set_system_state: entering BUSY for %.0fs "
+                "_set_system_state: entering BUSY for %.0fs BEFORE refresh "
                 "(buffered FIRE_IS_ON=%s)",
                 ON_OFF_BUSY_WAIT_TIME,
                 self._system_settings.get(Controller.Settings.FIRE_IS_ON),
             )
             self._state = Controller.State.BUSY
             self._busy_end_time = time() + ON_OFF_BUSY_WAIT_TIME
+
+        # Need to refresh immediately after setting
+        # (unless synching, in which case the poll loop will update)
+        if not sync:
+            _trace(
+                "_set_system_state: POST-COMMAND immediate refresh (ctrl_state=%s)",
+                self._state,
+            )
+            await self._refresh_system()
